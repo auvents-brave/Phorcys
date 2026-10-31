@@ -16,10 +16,9 @@ var deps: [Package.Dependency] = []
 let packageDirectory = URL(fileURLWithPath: #filePath).deletingLastPathComponent()
 let siblingsRoot = packageDirectory.deletingLastPathComponent()
 let isCheckout = siblingsRoot.lastPathComponent == "checkouts"
-for (name, url) in [
-	("Stheno", "https://github.com/auvents-brave/Stheno"),
-	("BoatTools", "https://github.com/auvents-brave/BoatTools"),
-] {
+// Stheno alone: nothing here decodes NMEA or talks to a boat, so BoatToolsKit
+// would only drag libcurl and swift-nio into a bridge that needs neither.
+for (name, url) in [("Stheno", "https://github.com/auvents-brave/Stheno")] {
 	let local = siblingsRoot.appendingPathComponent(name).path
 	if !isCheckout, FileManager.default.fileExists(atPath: local) {
 		deps.append(.package(path: local))
@@ -40,10 +39,7 @@ let package = Package(
 	targets: [
 		.target(
 			name: "Phorcys",
-			dependencies: [
-				.product(name: "Stheno", package: "Stheno"),
-				.product(name: "BoatToolsKit", package: "BoatTools"),
-			],
+			dependencies: [.product(name: "Stheno", package: "Stheno")],
 			path: "Sources/Phorcys",
 			swiftSettings: sharedSwiftSettings
 		),

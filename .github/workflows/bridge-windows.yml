@@ -1,0 +1,101 @@
+# Builds the Windows bridge DLLs the ThoosaUno companion app P/Invokes —
+# PhorcysBridge from this repository and SthenoBridge from the (public)
+# Stheno sibling — plus the Swift runtime DLLs they need, assembled into one
+# artifact per architecture. ThoosaUno's Scripts/package-downloads.sh fetches
+# the latest artifact to package the Windows downloads (ThoosaUno itself is
+# private, so its own Actions cannot build them; Swift also cannot
+# cross-compile to Windows from macOS or Linux).
+#
+# Two architectures build in parallel (fail-fast off, so an ARM toolchain gap
+# never blocks the x64 download): x64 on windows-2022, arm64 on windows-11-arm.
+name: Bridge Windows
+
+on:
+  push:
+    branches: [main, lab]
+    paths:
+      - "Bridge/**"
+      - ".github/workflows/bridge-windows.yml"
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.repository }}-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  SWIFT_VERSION: "6.4.1"
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
+jobs:
+  build:
+    name: Build (${{ matrix.arch }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: windows-2022
+            arch: x64
+            build_arch: amd64
+          - runner: windows-11-arm
+            arch: arm64
+            build_arch: arm64
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          path: Phorcys
+      # SthenoBridge lives in the Stheno sibling — same ref name, so a lab
+      # build pairs with Stheno's lab and a main build with its main.
+      - uses: actions/checkout@v6
+        with:
+          repository: auvents-brave/Stheno
+          ref: ${{ github.ref_name }}
+          path: Stheno
+
+      - uses: compnerd/gha-setup-swift@main
+        with:
+          branch: swift-${{ env.SWIFT_VERSION }}-release
+          tag: ${{ env.SWIFT_VERSION }}-RELEASE
+          # Match the toolchain to the runner — the amd64 default segfaults on the
+          # windows-11-arm runner (STATUS_ACCESS_VIOLATION).
+          build_arch: ${{ matrix.build_arch }}
+
+      - name: Build SthenoBridge
+        working-directory: Stheno/Bridge
+        run: swift build -c release
+
+      - name: Build PhorcysBridge
+        working-directory: Phorcys/Bridge
+        run: swift build -c release
+
+      # The bridges link the Swift runtime dynamically: ship its DLLs next to
+      # them so the packaged app needs no Swift installed. The runtime dir is
+      # on PATH (the toolchain setup put it there), so `where.exe` finds
+      # swiftCore.dll wherever the installer chose to live.
+      - name: Assemble bridges + Swift runtime
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Path stage | Out-Null
+          Copy-Item Stheno\Bridge\.build\release\SthenoBridge.dll stage\
+          Copy-Item Phorcys\Bridge\.build\release\PhorcysBridge.dll stage\
+          $core = (where.exe swiftCore.dll 2>$null | Select-Object -First 1)
+          if (-not $core) {
+            $core = @("$env:LOCALAPPDATA\Programs\Swift", "$env:ProgramFiles\Swift", "$env:SystemDrive\Library") |
+              Where-Object { Test-Path $_ } |
+              ForEach-Object { Get-ChildItem -Path $_ -Recurse -Filter swiftCore.dll -ErrorAction SilentlyContinue } |
+              Select-Object -First 1 -ExpandProperty FullName
+          }
+          if (-not $core) { Write-Error "swiftCore.dll not found (PATH, LocalAppData, ProgramFiles)"; exit 1 }
+          $runtime = Split-Path $core
+          Write-Host "Swift runtime: $runtime"
+          Copy-Item "$runtime\*.dll" stage\ -Force
+          Get-ChildItem stage | Format-Table Name, Length
+
+      - name: Upload bridges artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: phorcys-bridges-windows-${{ matrix.arch }}
+          path: stage
