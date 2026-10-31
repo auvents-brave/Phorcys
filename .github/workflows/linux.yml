@@ -35,5 +35,9 @@ jobs:
           swiftly use "${{ env.SWIFT_VERSION }}"
       - name: Check Swift Version
         run: swift --version
+      # Stheno's Bonjour discovery builds against the dns_sd shim, so even a
+      # package that never browses the network needs its headers to compile.
+      - name: Install Avahi (Bonjour/mDNS compatibility layer)
+        run: sudo apt-get install -y libavahi-compat-libdnssd-dev
       - run: swift build -c release
       - run: swift test
