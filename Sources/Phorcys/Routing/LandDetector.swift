@@ -44,9 +44,24 @@ struct LandDetector: Sendable {
 	/// rings and any high-precision tile coastlines — and finally re-tested shifted
 	/// by a clearance margin so it never grazes the shore.
 	func segmentCrossesLand(from: Coordinate, to: Coordinate) -> Bool {
-		// Endpoints first — the cheapest decisive test.
+		// Endpoints first — the cheapest decisive test, and the only one that catches
+		// a leg lying wholly inland: such a leg crosses no coastline edge at all.
 		if grid.isLand(from) || grid.isLand(to) { return true }
+		return seaLegCrossesLand(from: from, to: to)
+	}
 
+	/// Whether the straight leg `from` → `to` crosses land, both endpoints being
+	/// already known to be at sea.
+	///
+	/// Identical to ``segmentCrossesLand(from:to:)`` but for the endpoint containment
+	/// test, which on such a leg can only answer `false`. That test is the expensive
+	/// half: ``isLand(_:)`` casts a ray east and walks the whole grid row beyond the
+	/// point, where the leg itself touches only the handful of cells it passes
+	/// through. The router asks this of every visibility-graph leg — the graph nudges
+	/// its nodes offshore and keeps only those at sea, and both endpoints are snapped
+	/// there — which is the difference between a route in seconds and one in tens of
+	/// seconds.
+	func seaLegCrossesLand(from: Coordinate, to: Coordinate) -> Bool {
 		// Exact crossing test against nearby coastline edges.
 		if grid.segmentIntersectsCoast(from: from, to: to) { return true }
 
@@ -76,6 +91,18 @@ struct LandDetector: Sendable {
 		return false
 	}
 
+	/// Whether `point` has sea room: it is at sea, and no coastline edge — ring or
+	/// tile polyline — passes within `marginDegrees` of it.
+	///
+	/// ``segmentCrossesLand(from:to:)`` rejects a leg whose clearance-shifted copy
+	/// touches the coast, so a point lying closer to the shore than that clearance
+	/// has no usable leg at all, whichever way it heads: one of the two shifted
+	/// copies always starts inland. Snapping an endpoint therefore asks for sea
+	/// room rather than for mere sea.
+	func hasSeaRoom(_ point: Coordinate, marginDegrees: Double) -> Bool {
+		!grid.isLand(point) && !grid.coastPasses(within: marginDegrees, of: point)
+	}
+
 	/// Clearance a leg must keep off the coast, in degrees (≈ 0.5 nm) — a margin
 	/// that absorbs the simplified coastline's inland error so routes don't graze
 	/// the real shore.
@@ -92,13 +119,17 @@ private struct EdgeGrid: Sendable {
 	struct Edge: Sendable {
 		let a: Coordinate
 		let b: Coordinate
+		/// Which closed ring the edge came from, or `-1` for an edge of an open tile
+		/// polyline. Rings enclose land and so decide containment; a polyline encloses
+		/// nothing and takes part only in the crossing test.
+		let ring: Int
+		/// The westernmost grid column the edge is bucketed into. ``isLand(_:)`` meets
+		/// the same edge once per column it spans and counts it only in the first of
+		/// them, which this makes a comparison rather than a set lookup.
+		let minColumn: Int32
 	}
 
 	let edges: [Edge]
-	/// Number of leading entries in `edges` that belong to closed rings. Ring
-	/// edges drive both containment and crossing; the open coastline edges that
-	/// follow (`index >= ringEdgeCount`) drive only the crossing test.
-	let ringEdgeCount: Int
 	let bounds: GeoBoundingBox
 	let columns: Int
 	let rows: Int
@@ -112,31 +143,9 @@ private struct EdgeGrid: Sendable {
 	private static let targetCellDegrees = 0.1
 
 	init(polygons: [LandPolygon], coastlines: [[Coordinate]] = []) {
-		// Flatten every ring into its closing edges (the closed-polygon geometry).
-		var edges: [Edge] = []
-		for polygon in polygons {
-			let points = polygon.points
-			var previous = points.count - 1
-			for index in points.indices {
-				edges.append(Edge(a: points[previous], b: points[index]))
-				previous = index
-			}
-		}
-		ringEdgeCount = edges.count
-
-		// Append the open coastline polylines (consecutive vertices, not closed).
-		for line in coastlines {
-			for index in line.indices.dropFirst() {
-				edges.append(Edge(a: line[index - 1], b: line[index]))
-			}
-		}
-		self.edges = edges
-
-		// Overall bounds (union of every edge endpoint), with a hair of padding.
-		let allPoints = edges.flatMap { [$0.a, $0.b] }
-		let bounds =
-			GeoBoundingBox(points: allPoints)
-			?? GeoBoundingBox(minLatitude: 0, maxLatitude: 0, minLongitude: 0, maxLongitude: 0)
+		// The grid geometry settles which cells an edge belongs to, so the extent of
+		// the data has to be measured before any edge is built.
+		let bounds = Self.extent(of: polygons, and: coastlines)
 		self.bounds = bounds
 
 		let width = max(bounds.maxLongitude - bounds.minLongitude, Self.targetCellDegrees)
@@ -148,28 +157,90 @@ private struct EdgeGrid: Sendable {
 		cellWidth = width / Double(columns)
 		cellHeight = height / Double(rows)
 
-		// Insert each edge into every cell its bounding box overlaps.
+		(edges, buckets) = Self.index(
+			polygons: polygons, coastlines: coastlines, bounds: bounds,
+			columns: columns, rows: rows, cellWidth: cellWidth, cellHeight: cellHeight)
+	}
+
+	/// The union of every vertex in the dataset, or a degenerate box when there are
+	/// none. Walking the vertices is cheaper than gathering them: the alternative is
+	/// a second copy of a quarter of a million coordinates, live at the moment the
+	/// edges are being built.
+	private static func extent(of polygons: [LandPolygon], and coastlines: [[Coordinate]]) -> GeoBoundingBox {
+		var minLatitude = Double.infinity
+		var maxLatitude = -Double.infinity
+		var minLongitude = Double.infinity
+		var maxLongitude = -Double.infinity
+		func include(_ point: Coordinate) {
+			minLatitude = Swift.min(minLatitude, point.latitude)
+			maxLatitude = Swift.max(maxLatitude, point.latitude)
+			minLongitude = Swift.min(minLongitude, point.longitude)
+			maxLongitude = Swift.max(maxLongitude, point.longitude)
+		}
+		for polygon in polygons {
+			for point in polygon.points { include(point) }
+		}
+		for line in coastlines {
+			for point in line { include(point) }
+		}
+		guard minLatitude <= maxLatitude else {
+			return GeoBoundingBox(minLatitude: 0, maxLatitude: 0, minLongitude: 0, maxLongitude: 0)
+		}
+		return GeoBoundingBox(
+			minLatitude: minLatitude, maxLatitude: maxLatitude,
+			minLongitude: minLongitude, maxLongitude: maxLongitude)
+	}
+
+	/// Flattens every ring into its closing edges (the closed-polygon geometry),
+	/// then the open coastline polylines (consecutive vertices, not closed), and
+	/// buckets each edge into every cell its bounding box overlaps as it is made.
+	private static func index(
+		polygons: [LandPolygon],
+		coastlines: [[Coordinate]],
+		bounds: GeoBoundingBox,
+		columns: Int,
+		rows: Int,
+		cellWidth: Double,
+		cellHeight: Double
+	) -> (edges: [Edge], buckets: [Int: [Int]]) {
+		var edges: [Edge] = []
+		edges.reserveCapacity(
+			polygons.reduce(0) { $0 + $1.points.count }
+				+ coastlines.reduce(0) { $0 + max($1.count - 1, 0) })
 		var buckets: [Int: [Int]] = [:]
-		for (index, edge) in edges.enumerated() {
-			let minCol = Self.clampedColumn(
-				for: min(edge.a.longitude, edge.b.longitude), bounds: bounds, cellWidth: width / Double(columns),
-				columns: columns)
-			let maxCol = Self.clampedColumn(
-				for: max(edge.a.longitude, edge.b.longitude), bounds: bounds, cellWidth: width / Double(columns),
-				columns: columns)
-			let minRow = Self.clampedRow(
-				for: min(edge.a.latitude, edge.b.latitude), bounds: bounds, cellHeight: height / Double(rows),
-				rows: rows)
-			let maxRow = Self.clampedRow(
-				for: max(edge.a.latitude, edge.b.latitude), bounds: bounds, cellHeight: height / Double(rows),
-				rows: rows)
+
+		func add(_ a: Coordinate, _ b: Coordinate, ring: Int) {
+			let minColumn = clampedColumn(
+				for: min(a.longitude, b.longitude), bounds: bounds, cellWidth: cellWidth, columns: columns)
+			let maxColumn = clampedColumn(
+				for: max(a.longitude, b.longitude), bounds: bounds, cellWidth: cellWidth, columns: columns)
+			let minRow = clampedRow(
+				for: min(a.latitude, b.latitude), bounds: bounds, cellHeight: cellHeight, rows: rows)
+			let maxRow = clampedRow(
+				for: max(a.latitude, b.latitude), bounds: bounds, cellHeight: cellHeight, rows: rows)
+			let index = edges.count
+			edges.append(Edge(a: a, b: b, ring: ring, minColumn: Int32(minColumn)))
 			for row in minRow...maxRow {
-				for column in minCol...maxCol {
+				for column in minColumn...maxColumn {
 					buckets[row * columns + column, default: []].append(index)
 				}
 			}
 		}
-		self.buckets = buckets
+
+		for (ring, polygon) in polygons.enumerated() {
+			let points = polygon.points
+			var previous = points.count - 1
+			for index in points.indices {
+				add(points[previous], points[index], ring: ring)
+				previous = index
+			}
+		}
+		for line in coastlines {
+			for index in line.indices.dropFirst() {
+				add(line[index - 1], line[index], ring: -1)
+			}
+		}
+		return (edges, buckets)
 	}
 
 	// MARK: Queries
@@ -177,39 +248,58 @@ private struct EdgeGrid: Sendable {
 	/// Even-odd point-in-polygon test by casting a ray due east from `point` and
 	/// counting the coastline edges it crosses, scanning only the point's grid
 	/// row. A point outside the grid bounds is open water.
+	///
+	/// The crossings are counted *per ring* and the point is land if any one ring
+	/// encloses it. Pooling them into a single even-odd count would be wrong here:
+	/// the dataset is a union of independent land features (the loader keeps each
+	/// feature's outer ring and drops its holes), and the published coastline draws
+	/// a landmass twice wherever a high-detail OSM outline is merged over the coarse
+	/// base — Corsica, Elba and a dozen smaller islands, the pair wound opposite
+	/// ways each time, so counting the winding instead would cancel them just the
+	/// same. Two outlines of one island cancel under a pooled count, hollowing it
+	/// out: everything inland reads as open water, and an endpoint ashore is then
+	/// snapped into the middle of the island, where no leg can reach the sea and the
+	/// route comes back as `noRouteFound`.
 	func isLand(_ point: Coordinate) -> Bool {
 		guard bounds.contains(point) else { return false }
 		let row = clampedRow(point.latitude)
 		let startColumn = clampedColumn(point.longitude)
-		var crossings = 0
-		var seen = Set<Int>()
+		var crossings: [Int: Int] = [:]
 		for column in startColumn..<columns {
 			guard let bucket = buckets[row * columns + column] else { continue }
-			// Only closed-ring edges define containment; open coastline edges are
-			// skipped (they would corrupt the even-odd crossing count).
-			for index in bucket where index < ringEdgeCount && !seen.contains(index) {
-				seen.insert(index)
+			for index in bucket {
 				let edge = edges[index]
+				// An edge is bucketed into every cell it overlaps, so the scan meets it
+				// once per column it spans and must count it only once: in the first of
+				// those columns the scan reaches. ``Edge/minColumn`` settles that by
+				// comparison rather than by remembering every edge seen — this ray cast
+				// is the hottest loop in the library, and hashing dominated it.
+				guard Swift.max(Int(edge.minColumn), startColumn) == column else { continue }
+				// Only closed rings define containment; the open tile polylines are
+				// skipped (they would corrupt the crossing count).
+				guard edge.ring >= 0 else { continue }
 				let ya = edge.a.latitude
 				let yb = edge.b.latitude
 				guard (ya > point.latitude) != (yb > point.latitude) else { continue }
 				let crossingLongitude =
 					(edge.b.longitude - edge.a.longitude) * (point.latitude - ya) / (yb - ya) + edge.a.longitude
-				if crossingLongitude >= point.longitude { crossings += 1 }
+				if crossingLongitude >= point.longitude { crossings[edge.ring, default: 0] += 1 }
 			}
 		}
-		return crossings % 2 == 1
+		return crossings.values.contains { $0 % 2 == 1 }
 	}
 
 	/// Whether the leg `from` → `to` intersects any coastline edge, walking only
 	/// the cells the leg passes through (Amanatides–Woo grid traversal).
+	///
+	/// An edge spanning several of those cells is tested once per cell rather than
+	/// remembered: the test is a handful of arithmetic, where hashing it into a set
+	/// of seen edges cost more than the repeats ever do.
 	func segmentIntersectsCoast(from: Coordinate, to: Coordinate) -> Bool {
-		var seen = Set<Int>()
 		var hit = false
 		traverseCells(from: from, to: to) { key in
 			guard let bucket = buckets[key] else { return true }
-			for index in bucket where !seen.contains(index) {
-				seen.insert(index)
+			for index in bucket {
 				let edge = edges[index]
 				if LandDetector.segmentsIntersect(from, to, edge.a, edge.b) {
 					hit = true
@@ -219,6 +309,26 @@ private struct EdgeGrid: Sendable {
 			return true
 		}
 		return hit
+	}
+
+	/// Whether any coastline edge passes within `margin` degrees of `point`,
+	/// scanning only the cells the margin box overlaps. Unlike ``isLand(_:)`` this
+	/// counts the open tile polylines too: they are coast a hull can hit.
+	func coastPasses(within margin: Double, of point: Coordinate) -> Bool {
+		let minColumn = clampedColumn(point.longitude - margin)
+		let maxColumn = clampedColumn(point.longitude + margin)
+		let minRow = clampedRow(point.latitude - margin)
+		let maxRow = clampedRow(point.latitude + margin)
+		for row in minRow...maxRow {
+			for column in minColumn...maxColumn {
+				guard let bucket = buckets[row * columns + column] else { continue }
+				for index in bucket {
+					let edge = edges[index]
+					if LandDetector.distanceToSegmentDegrees(point, edge.a, edge.b) <= margin { return true }
+				}
+			}
+		}
+		return false
 	}
 
 	// MARK: Grid traversal
@@ -322,6 +432,22 @@ extension LandDetector {
 		if d3 == 0, onSegment(p1, p2, p3) { return true }
 		if d4 == 0, onSegment(p1, p2, p4) { return true }
 		return false
+	}
+
+	/// Distance, in degrees, from `point` to the segment `a`→`b`, taking longitude
+	/// and latitude as plain axes — the same flat measure the coast clearance and the
+	/// router's search margins are expressed in.
+	static func distanceToSegmentDegrees(_ point: Coordinate, _ a: Coordinate, _ b: Coordinate) -> Double {
+		let dx = b.longitude - a.longitude
+		let dy = b.latitude - a.latitude
+		let px = point.longitude - a.longitude
+		let py = point.latitude - a.latitude
+		let lengthSquared = dx * dx + dy * dy
+		guard lengthSquared > 0 else { return (px * px + py * py).squareRoot() }
+		let t = Swift.max(0, Swift.min(1, (px * dx + py * dy) / lengthSquared))
+		let cx = px - t * dx
+		let cy = py - t * dy
+		return (cx * cx + cy * cy).squareRoot()
 	}
 
 	/// The signed area (× 2) of triangle `abc`: positive for a counter-clockwise

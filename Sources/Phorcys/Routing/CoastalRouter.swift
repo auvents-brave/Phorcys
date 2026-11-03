@@ -115,7 +115,7 @@ public actor CoastalRouter {
 
 		// 2. Direct leg clear → single hop. (The orthodromic leg between the two
 		//    points is exactly this straight line; ``Geo`` supplies its length.)
-		if !detector.segmentCrossesLand(from: seaStart, to: seaEnd) {
+		if !detector.seaLegCrossesLand(from: seaStart, to: seaEnd) {
 			return [seaStart, seaEnd]
 		}
 
@@ -159,27 +159,57 @@ public actor CoastalRouter {
 
 	// MARK: Endpoint snapping
 
-	/// Returns `point` if it is at sea, otherwise the nearest open-water point
-	/// found by spiralling outward in rings of increasing radius.
+	/// Returns `point` if it already has sea room, otherwise the nearest point that
+	/// does, found by spiralling outward in rings of increasing radius.
+	///
+	/// Sea room, not merely sea, decides this — and it is asked of every endpoint,
+	/// not only one that reads as land. ``LandDetector/segmentCrossesLand(from:to:)``
+	/// rejects a leg whose clearance-shifted copy touches the coast, so from a point
+	/// closer in than that clearance every leg is refused, whichever way it heads,
+	/// and the route comes back as ``RoutingError/noRouteFound``. Three real cases
+	/// land there: a harbour ashore snapped no further than the first sea cell; a
+	/// berth or anchorage picked just off the beach; and harbour water the coarse
+	/// base coastline misplaces. At Toulon the `ne_10m` outline is drawn inland of
+	/// the real coast and wanders across the port: the Vieux-Port and the Petite
+	/// Rade fall outside it and so read as sea, penned into a pocket a mile or two
+	/// wide that no leg can leave, while the Grande Rade falls inside it and reads
+	/// as land. Whether an endpoint reads as land cannot tell the two apart, which
+	/// is why sea room is asked of every one of them; a coastline clipped to the
+	/// right place would move them less, or not at all.
+	///
+	/// The point is therefore held ``offshoreOffsetNm`` clear of the coast, exactly
+	/// as far out as the visibility graph's own nodes, which makes the first leg no
+	/// different from any leg between them. The cost is that a route may start or
+	/// finish a mile or two off the berth — the honest answer at this coastline's
+	/// resolution, the pilotage in and out being the skipper's.
 	private func snapToSea(
 		_ point: Coordinate,
 		using detector: LandDetector,
 		clock: ContinuousClock,
 		deadline: ContinuousClock.Instant
 	) throws -> Coordinate {
-		guard detector.isLand(point) else { return point }
+		guard !detector.hasSeaRoom(point, marginDegrees: Self.offshoreOffsetDegrees) else { return point }
 
 		let stepNm = 0.5
 		let maxNm = 60.0
 		var radius = stepNm
+		// A point already afloat, if cramped, is its own fallback: better the berth the
+		// user asked for than an arbitrary spot near it.
+		var afloat: Coordinate? = detector.isLand(point) ? nil : point
 		while radius <= maxNm {
 			try checkDeadline(clock: clock, deadline: deadline)
 			for bearing in stride(from: 0.0, to: 360.0, by: 15.0) {
 				let candidate = point.destination(bearing: bearing, distanceNauticalMiles: radius)
-				if !detector.isLand(candidate) { return candidate }
+				if detector.hasSeaRoom(candidate, marginDegrees: Self.offshoreOffsetDegrees) { return candidate }
+				if afloat == nil, !detector.isLand(candidate) { afloat = candidate }
 			}
 			radius += stepNm
 		}
+		// Water within range, but nowhere with room to manoeuvre — a creek, or a basin
+		// the coarse coastline draws tighter than it is. Take the nearest sea point
+		// anyway: the route may still fail, but no more often than it did before, and
+		// the endpoint is at least afloat.
+		if let afloat { return afloat }
 		throw RoutingError.endpointLandlocked
 	}
 
@@ -205,7 +235,7 @@ public actor CoastalRouter {
 		// route, so this corridor cuts the graph (A* is O(n²)) without losing any
 		// detour the margin already allows; growing the margin widens the corridor.
 		func inCorridor(_ point: Coordinate) -> Bool {
-			distanceToLineDegrees(point, start, end) <= margin
+			LandDetector.distanceToSegmentDegrees(point, start, end) <= margin
 		}
 
 		for polygon in detector.data.polygons where polygon.boundingBox.intersects(routeBox) {
@@ -298,11 +328,8 @@ public actor CoastalRouter {
 		guard length > 0 else { return [] }
 
 		// The two unit normals, scaled to the offshore offset, converted back to
-		// degrees (undoing the cosine scaling on longitude). The offset clears the
-		// coast clearance (≈ 0.5 nm) with room to spare, so coastal legs between
-		// these nodes aren't themselves rejected for running too close.
-		let offsetNm = 1.2
-		let offsetDegrees = offsetNm / 60.0
+		// degrees (undoing the cosine scaling on longitude).
+		let offsetDegrees = Self.offshoreOffsetDegrees
 		let nx = -ty / length
 		let ny = tx / length
 		let dLon = nx * offsetDegrees / max(cosLat, 0.000001)
@@ -370,16 +397,19 @@ public actor CoastalRouter {
 			closed[current] = true
 
 			for neighbour in neighbours(of: current) where !closed[neighbour] && neighbour != current {
-				// The leg must be clear of land (the goal is always a candidate, so the
-				// final hop is considered even when it is far from `current`).
-				if detector.segmentCrossesLand(from: nodes[current], to: nodes[neighbour]) { continue }
+				// Weigh the leg before testing it: only one that improves the neighbour's
+				// score can change anything, and in a dense graph most do not. The land test
+				// is far the most expensive thing here, so it goes second.
 				let tentative = gScore[current] + nodes[current].distanceKilometres(to: nodes[neighbour])
-				if tentative < gScore[neighbour] {
-					cameFrom[neighbour] = current
-					gScore[neighbour] = tentative
-					fScore[neighbour] = tentative + nodes[neighbour].distanceKilometres(to: goal)
-					open.insert(neighbour)
-				}
+				guard tentative < gScore[neighbour] else { continue }
+				// The leg must be clear of land (the goal is always a candidate, so the
+				// final hop is considered even when it is far from `current`). Every node in
+				// the graph sits at sea, so the cheaper sea-leg test applies.
+				if detector.seaLegCrossesLand(from: nodes[current], to: nodes[neighbour]) { continue }
+				cameFrom[neighbour] = current
+				gScore[neighbour] = tentative
+				fScore[neighbour] = tentative + nodes[neighbour].distanceKilometres(to: goal)
+				open.insert(neighbour)
 			}
 		}
 		throw RoutingError.noRouteFound
@@ -407,7 +437,7 @@ public actor CoastalRouter {
 		while anchor < path.count - 1 {
 			var farthest = anchor + 1
 			for candidate in (anchor + 2)..<path.count {
-				if detector.segmentCrossesLand(from: path[anchor], to: path[candidate]) { break }
+				if detector.seaLegCrossesLand(from: path[anchor], to: path[candidate]) { break }
 				farthest = candidate
 			}
 			result.append(path[farthest])
@@ -421,21 +451,6 @@ public actor CoastalRouter {
 	/// Throws ``RoutingError/timedOut`` once the deadline has passed.
 	private func checkDeadline(clock: ContinuousClock, deadline: ContinuousClock.Instant) throws {
 		if clock.now >= deadline { throw RoutingError.timedOut }
-	}
-
-	/// Distance, in degrees (matching ``GeoBoundingBox/diagonalDegrees`` and the
-	/// margin), from `point` to the segment `a`→`b` — the route's direct line.
-	private func distanceToLineDegrees(_ point: Coordinate, _ a: Coordinate, _ b: Coordinate) -> Double {
-		let dx = b.longitude - a.longitude
-		let dy = b.latitude - a.latitude
-		let px = point.longitude - a.longitude
-		let py = point.latitude - a.latitude
-		let lengthSquared = dx * dx + dy * dy
-		guard lengthSquared > 0 else { return (px * px + py * py).squareRoot() }
-		let t = max(0, min(1, (px * dx + py * dy) / lengthSquared))
-		let cx = px - t * dx
-		let cy = py - t * dy
-		return (cx * cx + cy * cy).squareRoot()
 	}
 
 	/// A vertex key snapped to a ~1 nm grid. Beyond de-duplicating offshore nodes
@@ -470,4 +485,12 @@ public actor CoastalRouter {
 
 	/// How far offshore (nm) the small-island detour ring sits beyond the island.
 	private static let offshoreMarginNm = 1.0
+
+	/// How far offshore (nm) a graph node sits from the coastline vertex it came
+	/// from, and how much sea room ``snapToSea(_:using:clock:deadline:)`` holds a
+	/// snapped endpoint to. Clears ``LandDetector``'s grazing clearance (≈ 0.5 nm)
+	/// with room to spare, so legs between these points aren't themselves rejected
+	/// for running too close to the coast.
+	private static let offshoreOffsetNm = 1.2
+	private static let offshoreOffsetDegrees = offshoreOffsetNm / 60.0
 }
