@@ -28,10 +28,10 @@ struct CoastalRouterTests {
 		try Data(geoJSON.utf8).write(to: directory.appending(path: "CoastalLand.geojson"))
 	}
 
-	/// The same island written twice over, as the published coastline carries
+	/// The same island written twice over, as the coastline as first published carried
 	/// Corsica and Elba: the coarse `ne_10m` ring, and a high-detail OSM outline
 	/// merged on top of it. The two disagree slightly along the shore and are wound
-	/// opposite ways, exactly as the shipped data has them.
+	/// opposite ways, exactly as that data had them.
 	private func doublyDrawnIsland(in directory: URL) throws {
 		let coarse = "[[0,0],[1,0],[1,1],[0,1],[0,0]]"
 		let detailed = "[[0.02,0.02],[0.02,1.02],[1.02,1.02],[1.02,0.02],[0.02,0.02]]"
@@ -131,9 +131,11 @@ struct CoastalRouterTests {
 	func doublyDrawnIslandIsSolid() throws {
 		// Counting the ray crossings in one pooled even-odd tally lets two outlines of
 		// one island cancel, so everything inland reads as open water and only the
-		// sliver where the outlines disagree reads as land. On the published coastline
-		// that hollows out Corsica and Elba, and an endpoint ashore is then snapped
-		// into the middle of the island, where no leg reaches the sea.
+		// sliver where the outlines disagree reads as land. That hollowed out Corsica
+		// and Elba on the coastline as first published, and an endpoint ashore was then
+		// snapped into the middle of the island, where no leg reaches the sea. The data
+		// has since been de-duplicated, which leaves this test as the guard: the
+		// semantics have to hold whatever the data does next.
 		let (_, detector) = try fixture(doublyDrawnIsland(in:))
 
 		#expect(detector.isLand(Coordinate(latitude: 0.5, longitude: 0.5)))  // inside both outlines

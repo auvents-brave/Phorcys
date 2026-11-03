@@ -251,15 +251,19 @@ private struct EdgeGrid: Sendable {
 	///
 	/// The crossings are counted *per ring* and the point is land if any one ring
 	/// encloses it. Pooling them into a single even-odd count would be wrong here:
-	/// the dataset is a union of independent land features (the loader keeps each
-	/// feature's outer ring and drops its holes), and the published coastline draws
-	/// a landmass twice wherever a high-detail OSM outline is merged over the coarse
-	/// base — Corsica, Elba and a dozen smaller islands, the pair wound opposite
-	/// ways each time, so counting the winding instead would cancel them just the
-	/// same. Two outlines of one island cancel under a pooled count, hollowing it
-	/// out: everything inland reads as open water, and an endpoint ashore is then
-	/// snapped into the middle of the island, where no leg can reach the sea and the
-	/// route comes back as `noRouteFound`.
+	/// the dataset is a union of independent land features, of which the loader keeps
+	/// each outer ring and drops the holes, so two rings drawn over the same ground
+	/// must union rather than cancel — and counting the winding instead would not
+	/// help, the duplicates being wound opposite ways.
+	///
+	/// They are not hypothetical. The coastline as first published drew Corsica, Elba
+	/// and a dozen smaller islands twice over, a high-detail OSM outline merged on top
+	/// of the coarse base, and a pooled count hollowed every one of them out:
+	/// everything inland read as open water, an endpoint ashore was snapped into the
+	/// middle of the island, and the route came back as `noRouteFound`. The published
+	/// data has since been de-duplicated, but a device that downloaded the earlier one
+	/// still carries it, and nothing in the format stops one outline being merged over
+	/// another again.
 	func isLand(_ point: Coordinate) -> Bool {
 		guard bounds.contains(point) else { return false }
 		let row = clampedRow(point.latitude)
